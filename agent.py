@@ -4,7 +4,9 @@ Plan -> Execute -> Observe -> Reflect, looping until the model finishes.
 """
 import os
 import json
+import re
 import textwrap
+import httpx
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -15,6 +17,8 @@ client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
 )
 
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
 # NOTE: 'openrouter/owl-alpha' was a placeholder in the original notebook.
 # Set a real OpenRouter model id, e.g. "anthropic/claude-3.5-sonnet" or "openai/gpt-4o".
 MODEL = os.getenv("AGENT_MODEL", "openrouter/owl-alpha")
@@ -22,13 +26,53 @@ MAX_ITERATIONS = 6  # safety ceiling on the loop
 
 
 # ── Tools the agent can call ────────────────────────────────────────────────
-# tool_search is a SIMULATED tool carried over from the notebook — it does not
-# actually search the web. Replace with a real search API call if you need
-# real answers.
 
-def tool_search(query: str) -> str:
-    """Simulated search tool. Replace with a real API call."""
-    return f"[Search result for '{query}']: Found relevant information about {query}."
+async def tool_search(query: str) -> str:
+    """
+    Real web search via Tavily (https://tavily.com), which returns an
+    LLM-ready answer plus a few supporting sources rather than raw HTML.
+
+    Falls back to a clearly-labeled placeholder if TAVILY_API_KEY isn't set,
+    so the app still runs (with degraded, non-factual answers) for anyone
+    who hasn't configured a search key yet.
+    """
+    if not TAVILY_API_KEY:
+        return (
+            f"[No search provider configured — set TAVILY_API_KEY to enable "
+            f"real search] Unable to search for: {query}"
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "search_depth": "basic",
+                    "include_answer": True,
+                    "max_results": 3,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as e:
+        return f"Search failed: {e}"
+
+    parts = []
+    if data.get("answer"):
+        parts.append(f"Summary: {data['answer']}")
+
+    for r in data.get("results", [])[:3]:
+        title = r.get("title", "")
+        url = r.get("url", "")
+        content = (r.get("content") or "")[:300]
+        parts.append(f"- {title} ({url}): {content}")
+
+    if not parts:
+        return f"No search results found for: {query}"
+
+    return "\n".join(parts)
 
 
 def tool_calculate(expression: str) -> str:
@@ -72,6 +116,48 @@ async def run_tool(name: str, input_str: str) -> str:
 
 
 # ── System prompt ────────────────────────────────────────────────────────────
+
+def parse_step(raw: str) -> dict | None:
+    """
+    Try to pull a single JSON object out of a model response.
+
+    Handles three real-world failure modes seen in production:
+      - clean JSON (the happy path)
+      - JSON wrapped in markdown ```json fences
+      - JSON with stray prose before/after it
+      - an empty / whitespace-only response (returns None instead of raising)
+
+    Returns the parsed dict, or None if no valid JSON object could be found.
+    """
+    if not raw or not raw.strip():
+        return None
+
+    text = raw.strip()
+
+    # 1. try as-is
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. strip markdown code fences if present
+    fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    if fenced != text:
+        try:
+            return json.loads(fenced)
+        except json.JSONDecodeError:
+            pass
+
+    # 3. last resort: grab the first {...} block anywhere in the text
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
 
 def build_system_prompt() -> str:
     tool_descriptions = "\n".join(
@@ -135,13 +221,64 @@ async def run_agent(goal: str, on_step=None, is_cancelled=None) -> dict:
             max_tokens=500,
             messages=messages,
         )
-        raw = response.choices[0].message.content.strip()
+        raw = (response.choices[0].message.content or "").strip()
 
-        try:
-            step = json.loads(raw)
-        except json.JSONDecodeError:
-            cleaned = raw.strip("`").replace("json\n", "", 1)
-            step = json.loads(cleaned)
+        step = parse_step(raw)
+
+        if step is None:
+            # The model returned something we couldn't parse as JSON (empty
+            # response, prose, a refusal, etc). Give it one corrective nudge
+            # rather than crashing the whole request with a 500.
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your last response was not valid JSON, or was empty. "
+                    "Respond with EXACTLY one JSON object as instructed, "
+                    "and nothing else."
+                ),
+            })
+
+            retry_response = await client.chat.completions.create(
+                model=MODEL,
+                max_tokens=500,
+                messages=messages,
+            )
+            raw = (retry_response.choices[0].message.content or "").strip()
+            step = parse_step(raw)
+
+            if step is None:
+                # Still couldn't get usable JSON after a retry. Stop cleanly
+                # instead of crashing, and surface this to the UI as the
+                # final answer so the user sees *something* instead of a 500.
+                fallback = (
+                    "The agent's underlying model returned an unreadable "
+                    "response and could not continue. Try again, or try a "
+                    "different model in AGENT_MODEL."
+                )
+                steps.append({
+                    "iteration": iteration,
+                    "type": "finish",
+                    "thought": "",
+                    "answer": fallback,
+                })
+                return {"answer": fallback, "steps": steps}
+
+        if "action" not in step:
+            # Malformed but parseable JSON (missing required field) — treat
+            # the same as an unparseable response rather than KeyError-ing.
+            fallback = (
+                "The agent's underlying model returned an incomplete step "
+                "and could not continue. Try again, or try a different "
+                "model in AGENT_MODEL."
+            )
+            steps.append({
+                "iteration": iteration,
+                "type": "finish",
+                "thought": step.get("thought", ""),
+                "answer": fallback,
+            })
+            return {"answer": fallback, "steps": steps}
 
         thought = step.get("thought", "")
 
@@ -150,18 +287,18 @@ async def run_agent(goal: str, on_step=None, is_cancelled=None) -> dict:
                 "iteration": iteration,
                 "type": "finish",
                 "thought": thought,
-                "answer": step["answer"],
+                "answer": step.get("answer", "(no answer provided)"),
             }
             steps.append(record)
             if on_step:
                 on_step(record)
-            return {"answer": step["answer"], "steps": steps}
+            return {"answer": record["answer"], "steps": steps}
 
         if await cancelled():
             return {"answer": None, "steps": steps, "cancelled": True}
 
-        tool_name = step["tool"]
-        tool_input = step["input"]
+        tool_name = step.get("tool", "")
+        tool_input = step.get("input", "")
         observation = await run_tool(tool_name, tool_input)
 
         record = {
