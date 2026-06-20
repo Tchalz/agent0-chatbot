@@ -5,12 +5,12 @@ Plan -> Execute -> Observe -> Reflect, looping until the model finishes.
 import os
 import json
 import textwrap
-from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(
+client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     base_url="https://openrouter.ai/api/v1",
 )
@@ -43,9 +43,9 @@ def tool_calculate(expression: str) -> str:
         return f"Error: {e}"
 
 
-def tool_summarise(text: str) -> str:
+async def tool_summarise(text: str) -> str:
     """Summarise text using the LLM."""
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=MODEL,
         max_tokens=200,
         messages=[{"role": "user", "content": f"Summarise this in 2 sentences:\n{text}"}],
@@ -60,11 +60,15 @@ TOOLS = {
 }
 
 
-def run_tool(name: str, input_str: str) -> str:
+async def run_tool(name: str, input_str: str) -> str:
     if name not in TOOLS:
         return f"Unknown tool '{name}'"
     fn, _ = TOOLS[name]
-    return fn(input_str)
+    result = fn(input_str)
+    # tool_search and tool_calculate are sync, tool_summarise is async
+    if hasattr(result, "__await__"):
+        result = await result
+    return result
 
 
 # ── System prompt ────────────────────────────────────────────────────────────
@@ -97,14 +101,20 @@ def build_system_prompt() -> str:
 
 # ── Core agent loop ──────────────────────────────────────────────────────────
 
-def run_agent(goal: str, on_step=None) -> dict:
+async def run_agent(goal: str, on_step=None, is_cancelled=None) -> dict:
     """
     Run the agent loop for a single goal.
 
     on_step: optional callback(dict) invoked after every iteration with a
              step record, useful for streaming progress to a UI.
+    is_cancelled: optional async callable returning True if the caller wants
+             the loop to stop early (e.g. the client disconnected after
+             clicking Stop). Checked before each LLM call and after each
+             tool call, so a cancellation lands within one step instead of
+             waiting for the full 6-iteration loop to finish.
 
-    Returns a dict: {"answer": str, "steps": [list of step records]}
+    Returns a dict: {"answer": str, "steps": [...]} or, if cancelled,
+    {"answer": None, "steps": [...], "cancelled": True}.
     """
     messages = [
         {"role": "system", "content": build_system_prompt()},
@@ -113,8 +123,14 @@ def run_agent(goal: str, on_step=None) -> dict:
 
     steps = []
 
+    async def cancelled() -> bool:
+        return bool(is_cancelled) and await is_cancelled()
+
     for iteration in range(1, MAX_ITERATIONS + 1):
-        response = client.chat.completions.create(
+        if await cancelled():
+            return {"answer": None, "steps": steps, "cancelled": True}
+
+        response = await client.chat.completions.create(
             model=MODEL,
             max_tokens=500,
             messages=messages,
@@ -141,9 +157,12 @@ def run_agent(goal: str, on_step=None) -> dict:
                 on_step(record)
             return {"answer": step["answer"], "steps": steps}
 
+        if await cancelled():
+            return {"answer": None, "steps": steps, "cancelled": True}
+
         tool_name = step["tool"]
         tool_input = step["input"]
-        observation = run_tool(tool_name, tool_input)
+        observation = await run_tool(tool_name, tool_input)
 
         record = {
             "iteration": iteration,
@@ -156,6 +175,9 @@ def run_agent(goal: str, on_step=None) -> dict:
         steps.append(record)
         if on_step:
             on_step(record)
+
+        if await cancelled():
+            return {"answer": None, "steps": steps, "cancelled": True}
 
         messages.append({"role": "assistant", "content": raw})
         messages.append({"role": "user", "content": f"Observation: {observation}"})
